@@ -4,5 +4,6 @@
 
 azure-functions
 azure-ai-formrecognizer
+azure-ai-textanalytics
 azurefunctions-extensions-bindings-blob
 pymupdf
