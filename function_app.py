@@ -3,40 +3,65 @@ import requests
 import logging
 import json
 import fitz
-import sys
 import io
 import os
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.formrecognizer import DocumentAnalysisClient
 from azure.ai.textanalytics import TextAnalyticsClient
-from azure.storage.blob import BlobServiceClient, BlobClient, ContainerClient
+from azure.storage.blob import BlobServiceClient
 
 app = func.FunctionApp()
 
 @app.blob_trigger(arg_name="myblob", path="inbound",
                                connection="STORAGE_CONNECTION_STRING")
 def FileUpload(myblob: func.InputStream):
-    logging.info(f"Python blob trigger function processed blob"
-                f"Name: {myblob.name}"
-                f"Blob Size: {myblob.length} bytes")
+    logging.info(f'Python blob trigger function processed {myblob.name}')
     data = myblob.read()
-    form = get_form_recognizer(data)
-    entities = get_pii_entities([form['content']])
-    redactions = get_chatgpt_response(entities, form['content'])
-    filename = f'{myblob.name.replace(".pdf", "").replace("inbound/", "")}-redacted.pdf'
-    output = redact_pdf(data, form, redactions)
 
-    stream = io.BytesIO()
-    output.save(stream)
-    output.close()
-    
-    blob_client = BlobServiceClient.from_connection_string(os.environ["STORAGE_CONNECTION_STRING"]).get_blob_client(container='outbound', blob=filename)
-    blob_client.upload_blob(stream.getvalue(), overwrite=True)
+    # Define the models for each document type
+    MODELS = {
+      "Headstone Application": "2024-07-26-v1",
+      "Invoice": "",
+      "Medical Record": "2024-07-30-v1",
+      "Quote": ""
+    }
 
-def get_form_recognizer(blob):
+    # Get the document classification
+    documents = get_document_classification(data)
+    for document in documents['documents']:
+        doc_type = document['doc_type']
+        model_id = MODELS[doc_type]
+
+        # Calculate range of page numbers per document
+        page_numbers = [region['page_number'] for region in document['bounding_regions']]
+        pages = page_numbers[0]
+        if len(page_numbers) > 0:
+            min_page = min(page_numbers)
+            max_page = max(page_numbers)
+            pages = f'{min_page}-{max_page}'
+
+        logging.info(f'Processing document type {doc_type} with pages {pages}')
+        # Run custom extraction to get document content
+        form = get_document_content(data, model_id, pages)
+        # Extract PII entities from document content
+        entities = get_pii_entities([form['content']])
+        # Get redactions from OpenAI
+        redactions = get_chatgpt_response(entities, form['content'])
+        # Rename file
+        filename = f'{myblob.name.replace(".pdf", "").replace("inbound/", "")}-redacted.pdf'
+        # Create new PDF file with redactions
+        output = redact_pdf(data, form, redactions)
+        # Save the redacted PDF to Azure Storage
+        stream = io.BytesIO()
+        output.save(stream)
+        output.close()
+        blob_client = BlobServiceClient.from_connection_string(os.environ["STORAGE_CONNECTION_STRING"]).get_blob_client(container='outbound', blob=filename)
+        blob_client.upload_blob(stream.getvalue(), overwrite=True)
+
+def get_document_classification(blob):
     endpoint = os.environ["FORM_RECOGNIZER_ENDPOINT"]
     key = os.environ["FORM_RECOGNIZER_KEY"]
-    model_id = os.environ["FORM_RECOGNIZER_MODEL_ID"]
+    model_id = os.environ["FORM_RECOGNIZER_CLASSIFIER_MODEL_ID"]
 
     document_analysis_client = DocumentAnalysisClient(
         endpoint=endpoint, credential=AzureKeyCredential(key)
@@ -44,9 +69,35 @@ def get_form_recognizer(blob):
 
     # Make sure your document's type is included in the list of document types the custom model can analyze
     #with open(blob.read(), 'rb') as f:
-    poller = document_analysis_client.begin_analyze_document(model_id, blob)
+    poller = document_analysis_client.begin_classify_document(model_id, blob)
     result = poller.result()
     return result.to_dict()
+
+def get_document_content(blob, model_id, pages):
+    endpoint = os.environ["FORM_RECOGNIZER_ENDPOINT"]
+    key = os.environ["FORM_RECOGNIZER_KEY"]
+
+    document_analysis_client = DocumentAnalysisClient(
+        endpoint=endpoint, credential=AzureKeyCredential(key)
+    )
+
+    # Make sure your document's type is included in the list of document types the custom model can analyze
+    #with open(blob.read(), 'rb') as f:
+    poller = document_analysis_client.begin_analyze_document(model_id, blob, pages=pages)
+    result = poller.result()
+    return result.to_dict()
+
+def get_pii_entities(blob):
+    endpoint = os.environ["LANGUAGE_ENDPOINT"]
+    key = os.environ["LANGUAGE_KEY"]
+
+    text_analytics_client = TextAnalyticsClient(
+        endpoint=endpoint, credential=AzureKeyCredential(key)
+    )
+
+    result = text_analytics_client.recognize_pii_entities(blob)
+    entities = [{'text': entity.text, 'category': entity.category} for entity in result[0].entities]
+    logging.info(entities)
 
 def get_chatgpt_response(entities, content):
     GPT4V_KEY = os.environ["OPENAI_KEY"]
@@ -113,18 +164,6 @@ def get_chatgpt_response(entities, content):
     content = response.json()['choices'][0]['message']['content'].replace('```', '').replace('json', '')
     logging.info(content)
     return json.loads(content)
-
-def get_pii_entities(blob):
-    endpoint = os.environ["LANGUAGE_ENDPOINT"]
-    key = os.environ["LANGUAGE_KEY"]
-
-    text_analytics_client = TextAnalyticsClient(
-        endpoint=endpoint, credential=AzureKeyCredential(key)
-    )
-
-    result = text_analytics_client.recognize_pii_entities(blob)
-    entities = [{'text': entity.text, 'category': entity.category} for entity in result[0].entities]
-    logging.info(entities)
 
 def redact_pdf(blob, form, redactions):
     # Open the PDF
